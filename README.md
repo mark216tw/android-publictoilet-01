@@ -24,6 +24,16 @@
 2. 安裝 `app/build/outputs/apk/debug/app-debug.apk`，開啟 App 並允許定位。
 3. 從清單選擇廁所，或切換至地圖瀏覽；使用方式見[使用指南](docs/使用指南.md)。
 
+### 測試發行版本（Pre-release）
+
+使用 `prerelease` Build Type 可建置版本 `1.0.0-prerelease`：啟用 R8 程式碼壓縮與資源縮減，並以 Android **Debug 金鑰**簽署。此 APK 用於測試，並非正式上線版本。
+
+```powershell
+.\gradlew.bat :app:assemblePrerelease
+```
+
+輸出位於 `app/build/outputs/apk/prerelease/app-prerelease.apk`。macOS／Linux 請使用 `./gradlew :app:assemblePrerelease`。
+
 ## 更新資料
 
 原始 CSV `907f0805-d09d-41ea-80cd-563368c420f4.csv` 來自[臺南市公廁地址（資料集 7005）](https://data.gov.tw/dataset/7005)，目前有 **4,449 筆**。App 使用 `app/src/main/assets/toilets.json`，目前整理為 **2,383 個場所**。取得相同欄位格式的新 CSV 後，使用 Python 3.10 以上執行：
