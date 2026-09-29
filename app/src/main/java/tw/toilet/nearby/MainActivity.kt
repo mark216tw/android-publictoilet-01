@@ -69,6 +69,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.google.android.gms.location.CurrentLocationRequest
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
@@ -150,6 +151,7 @@ class MainActivity : ComponentActivity() {
                     toilets = toilets, nearby = nearby, location = location, loading = loading,
                     loadError = loadError, hasPermission = permissionGranted,
                     onRequestLocation = ::requestLocation,
+                    onLocate = ::locateCurrent,
                     onLocationSettings = { startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) },
                     onBrowse = ::browse,
                     onSettings = { showSettings = true },
@@ -202,6 +204,34 @@ class MainActivity : ComponentActivity() {
     private fun isRecent(value: Location) =
         SystemClock.elapsedRealtimeNanos() - value.elapsedRealtimeNanos in 0..300_000_000_000L
 
+    private fun locateCurrent(onResult: (Location?) -> Unit) {
+        if (!hasLocationPermission()) {
+            requestLocation()
+            onResult(null)
+            return
+        }
+        try {
+            val request = CurrentLocationRequest.Builder()
+                .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+                .setMaxUpdateAgeMillis(0L)
+                .setDurationMillis(15_000L)
+                .build()
+            locationClient.getCurrentLocation(request, null)
+                .addOnSuccessListener { current ->
+                    if (current != null && hasLocationPermission()) location = current
+                    else Toast.makeText(this, "無法取得目前位置，請確認定位已開啟", Toast.LENGTH_SHORT).show()
+                    onResult(current?.takeIf { hasLocationPermission() })
+                }
+                .addOnFailureListener {
+                    Toast.makeText(this, "無法取得目前位置，請稍後再試", Toast.LENGTH_SHORT).show()
+                    onResult(null)
+                }
+        } catch (_: SecurityException) {
+            requestLocation()
+            onResult(null)
+        }
+    }
+
     private fun browse(toilet: Toilet) {
         val coordinates = "${toilet.latitude},${toilet.longitude}"
         val googleMaps = Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=$coordinates"))
@@ -226,6 +256,7 @@ private fun ToiletApp(
     toilets: List<Toilet>, nearby: List<NearbyToilet>, location: Location?, loading: Boolean, loadError: Boolean,
     hasPermission: Boolean, onRequestLocation: () -> Unit, onLocationSettings: () -> Unit,
     onBrowse: (Toilet) -> Unit, onSettings: () -> Unit,
+    onLocate: ((Location?) -> Unit) -> Unit,
 ) {
     var showMap by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<NearbyToilet?>(null) }
@@ -246,7 +277,7 @@ private fun ToiletApp(
                 if (showMap) OutlinedButton(onClick = { showMap = false }) { Text("清單") }
                 else Button(onClick = { showMap = false }) { Text("清單") }
                 if (showMap) Button(onClick = { showMap = true }) { Text("地圖") }
-                else OutlinedButton(onClick = { showMap = true }) { Text("地圖") }
+                else OutlinedButton(onClick = { selected = null; showMap = true }) { Text("地圖") }
                 Spacer(Modifier.weight(1f))
                 if (!showMap) OutlinedButton(onClick = onRequestLocation) { Text("重整") }
             }
@@ -266,7 +297,8 @@ private fun ToiletApp(
             }
             nearby.isEmpty() -> EmptyMessage("附近沒有收錄的廁所。")
             showMap -> ToiletMap(toilets, location, visibleSelection,
-                onSelect = { selected = it }, onCloseSelection = { selected = null }, onBrowse = onBrowse)
+                onSelect = { selected = it }, onCloseSelection = { selected = null },
+                onBrowse = onBrowse, onLocate = onLocate)
             else -> LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -335,6 +367,7 @@ private fun Badge(text: String, background: Color, foreground: Color) {
 private fun ToiletMap(
     toilets: List<Toilet>, location: Location, selected: NearbyToilet?,
     onSelect: (NearbyToilet) -> Unit, onCloseSelection: () -> Unit, onBrowse: (Toilet) -> Unit,
+    onLocate: ((Location?) -> Unit) -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -343,12 +376,13 @@ private fun ToiletMap(
             setTileSource(TileSourceFactory.MAPNIK)
             setMultiTouchControls(true)
             setBuiltInZoomControls(false)
-            controller.setZoom(15.0)
+            controller.setZoom(18.0)
         }
     }
     var centered by remember { mutableStateOf(false) }
     var lastSelectedId by remember { mutableStateOf<String?>(null) }
     var selectedGroup by remember { mutableStateOf<List<Toilet>>(emptyList()) }
+    var locating by remember { mutableStateOf(false) }
     var detailsHeightPx by remember { mutableIntStateOf(0) }
     val density = LocalDensity.current
     val coordinateGroups = remember(toilets) {
@@ -499,12 +533,18 @@ private fun ToiletMap(
                     .onSizeChanged { detailsHeightPx = it.height })
         }
         Button(onClick = {
-            mapView.controller.setZoom(mapView.zoomLevelDouble.coerceAtLeast(19.0))
-            mapView.controller.animateTo(GeoPoint(location.latitude, location.longitude))
-        }, modifier = Modifier.align(Alignment.BottomEnd).padding(
+            locating = true
+            onLocate { current ->
+                locating = false
+                if (current != null && mapView.isAttachedToWindow) {
+                    mapView.controller.setZoom(18.0)
+                    mapView.controller.animateTo(GeoPoint(current.latitude, current.longitude))
+                }
+            }
+        }, enabled = !locating, modifier = Modifier.align(Alignment.BottomEnd).padding(
             end = 16.dp, bottom = if (selected != null || selectedGroup.isNotEmpty()) {
                 with(density) { detailsHeightPx.toDp() } + 28.dp
             } else 16.dp,
-        )) { Text("◎ 定位") }
+        )) { Text(if (locating) "定位中…" else "◎ 定位") }
     }
 }
