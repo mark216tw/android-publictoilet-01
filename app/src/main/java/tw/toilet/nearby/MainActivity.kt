@@ -9,6 +9,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
+import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -43,6 +45,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableFloatStateOf
@@ -75,6 +78,7 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import kotlinx.coroutines.delay
 import org.osmdroid.config.Configuration
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
@@ -201,16 +205,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun isRecent(value: Location) =
-        SystemClock.elapsedRealtimeNanos() - value.elapsedRealtimeNanos in 0..300_000_000_000L
+    private fun isRecent(value: Location) = isWithinAge(value, 300_000L)
 
-    private fun locateCurrent(onResult: (Location?) -> Unit) {
+    private fun isWithinAge(value: Location, maxAgeMillis: Long) =
+        SystemClock.elapsedRealtimeNanos() - value.elapsedRealtimeNanos in 0..(maxAgeMillis * 1_000_000L)
+
+    private fun locateCurrent(onPreview: (Location) -> Unit, onResult: (Location?) -> Unit) {
         if (!hasLocationPermission()) {
             requestLocation()
             onResult(null)
             return
         }
+        var finished = false
+        var previewShown = false
+        fun preview(candidate: Location?) {
+            if (!finished && !previewShown && candidate != null && isWithinAge(candidate, 60_000L)) {
+                previewShown = true
+                location = candidate
+                onPreview(candidate)
+            }
+        }
+        preview(location)
         try {
+            locationClient.lastLocation.addOnSuccessListener { last ->
+                if (hasLocationPermission()) preview(last)
+            }
             val request = CurrentLocationRequest.Builder()
                 .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
                 .setMaxUpdateAgeMillis(0L)
@@ -218,15 +237,17 @@ class MainActivity : ComponentActivity() {
                 .build()
             locationClient.getCurrentLocation(request, null)
                 .addOnSuccessListener { current ->
-                    if (current != null && hasLocationPermission()) location = current
-                    else Toast.makeText(this, "無法取得目前位置，請確認定位已開啟", Toast.LENGTH_SHORT).show()
-                    onResult(current?.takeIf { hasLocationPermission() })
+                    finished = true
+                    val updated = current?.takeIf { hasLocationPermission() }
+                    if (updated != null) location = updated
+                    onResult(updated)
                 }
                 .addOnFailureListener {
-                    Toast.makeText(this, "無法取得目前位置，請稍後再試", Toast.LENGTH_SHORT).show()
+                    finished = true
                     onResult(null)
                 }
         } catch (_: SecurityException) {
+            finished = true
             requestLocation()
             onResult(null)
         }
@@ -256,7 +277,7 @@ private fun ToiletApp(
     toilets: List<Toilet>, nearby: List<NearbyToilet>, location: Location?, loading: Boolean, loadError: Boolean,
     hasPermission: Boolean, onRequestLocation: () -> Unit, onLocationSettings: () -> Unit,
     onBrowse: (Toilet) -> Unit, onSettings: () -> Unit,
-    onLocate: ((Location?) -> Unit) -> Unit,
+    onLocate: ((Location) -> Unit, (Location?) -> Unit) -> Unit,
 ) {
     var showMap by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<NearbyToilet?>(null) }
@@ -367,22 +388,49 @@ private fun Badge(text: String, background: Color, foreground: Color) {
 private fun ToiletMap(
     toilets: List<Toilet>, location: Location, selected: NearbyToilet?,
     onSelect: (NearbyToilet) -> Unit, onCloseSelection: () -> Unit, onBrowse: (Toilet) -> Unit,
-    onLocate: ((Location?) -> Unit) -> Unit,
+    onLocate: ((Location) -> Unit, (Location?) -> Unit) -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    var locating by remember { mutableStateOf(false) }
+    var movedDuringLocate by remember { mutableStateOf(false) }
+    var previewShown by remember { mutableStateOf(false) }
+    var locateFeedback by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(locateFeedback) {
+        if (locateFeedback?.startsWith("位置已更新") == true) {
+            delay(3_000L)
+            locateFeedback = null
+        }
+    }
     val mapView = remember {
         MapView(context).apply {
             setTileSource(TileSourceFactory.MAPNIK)
             setMultiTouchControls(true)
             setBuiltInZoomControls(false)
             controller.setZoom(18.0)
+            val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+            var downX = 0f
+            var downY = 0f
+            setOnTouchListener { _, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = event.x
+                        downY = event.y
+                    }
+                    MotionEvent.ACTION_POINTER_DOWN -> if (locating) movedDuringLocate = true
+                    MotionEvent.ACTION_MOVE -> if (locating) {
+                        val dx = event.x - downX
+                        val dy = event.y - downY
+                        if (dx * dx + dy * dy > touchSlop * touchSlop) movedDuringLocate = true
+                    }
+                }
+                false // 保留 osmdroid 原本的拖曳、點擊及縮放手勢。
+            }
         }
     }
     var centered by remember { mutableStateOf(false) }
     var lastSelectedId by remember { mutableStateOf<String?>(null) }
     var selectedGroup by remember { mutableStateOf<List<Toilet>>(emptyList()) }
-    var locating by remember { mutableStateOf(false) }
     var detailsHeightPx by remember { mutableIntStateOf(0) }
     val density = LocalDensity.current
     val coordinateGroups = remember(toilets) {
@@ -532,19 +580,45 @@ private fun ToiletMap(
                 modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp)
                     .onSizeChanged { detailsHeightPx = it.height })
         }
-        Button(onClick = {
-            locating = true
-            onLocate { current ->
-                locating = false
-                if (current != null && mapView.isAttachedToWindow) {
-                    mapView.controller.setZoom(18.0)
-                    mapView.controller.animateTo(GeoPoint(current.latitude, current.longitude))
-                }
-            }
-        }, enabled = !locating, modifier = Modifier.align(Alignment.BottomEnd).padding(
+        Column(modifier = Modifier.align(Alignment.BottomEnd).padding(
             end = 16.dp, bottom = if (selected != null || selectedGroup.isNotEmpty()) {
                 with(density) { detailsHeightPx.toDp() } + 28.dp
             } else 16.dp,
-        )) { Text(if (locating) "定位中…" else "◎ 定位") }
+        ), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            locateFeedback?.let { message ->
+                Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surface) {
+                    Text(message, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            Button(onClick = {
+                locating = true
+                movedDuringLocate = false
+                previewShown = false
+                locateFeedback = "取得目前位置中…"
+                onLocate({ recent ->
+                    previewShown = true
+                    val seconds = ((SystemClock.elapsedRealtimeNanos() - recent.elapsedRealtimeNanos) /
+                        1_000_000_000L).coerceAtLeast(0L)
+                    locateFeedback = "最近位置（${seconds} 秒前）・更新中…"
+                    if (!movedDuringLocate && mapView.isAttachedToWindow) {
+                        mapView.controller.setZoom(18.0)
+                        mapView.controller.animateTo(GeoPoint(recent.latitude, recent.longitude))
+                    }
+                }, { current ->
+                    locating = false
+                    locateFeedback = when {
+                        current == null && previewShown -> "更新失敗，顯示最近一次位置"
+                        current == null -> "無法取得目前位置"
+                        movedDuringLocate -> "位置已更新（地圖未移動）"
+                        else -> "位置已更新"
+                    }
+                    if (current != null && !movedDuringLocate && mapView.isAttachedToWindow) {
+                        mapView.controller.setZoom(18.0)
+                        mapView.controller.animateTo(GeoPoint(current.latitude, current.longitude))
+                    }
+                })
+            }, enabled = !locating) { Text(if (locating) "定位中…" else "◎ 定位") }
+        }
     }
 }
